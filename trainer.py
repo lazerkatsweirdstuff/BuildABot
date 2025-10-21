@@ -208,88 +208,92 @@ class TextDataset(Dataset):
         }
 
 # =============================================================================
-# MODEL COMPONENTS
+# ADVANCED MODEL COMPONENTS
 # =============================================================================
 
-class SimpleGPT(nn.Module):
-    """A simplified GPT-like model for faster training"""
-    def __init__(self, vocab_size, d_model=512, n_layers=6, n_heads=8, max_seq_len=512):
+class RMSNorm(nn.Module):
+    """Root Mean Square Normalization (used in LLaMA)"""
+    def __init__(self, d_model, eps=1e-5):
         super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        return self.weight * (x / rms)
+
+class LayerScale(nn.Module):
+    """LayerScale for stable deep networks"""
+    def __init__(self, d_model, init_value=1e-2):
+        super().__init__()
+        self.gamma = nn.Parameter(init_value * torch.ones(d_model))
+
+    def forward(self, x):
+        return x * self.gamma
+
+class ReZero(nn.Module):
+    """ReZero normalization - learnable residual scaling"""
+    def __init__(self):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, sublayer):
+        return x + self.alpha * sublayer(x)
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation function (used in PaLM)"""
+    def __init__(self, d_model, d_ff=None):
+        super().__init__()
+        if d_ff is None:
+            d_ff = d_model * 4 // 3 * 2  # SwiGLU specific expansion
+        
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_model, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
+        self.swish = nn.SiLU()
+
+    def forward(self, x):
+        return self.w3(self.swish(self.w1(x)) * self.w2(x))
+
+class MultiQueryAttention(nn.Module):
+    """Multi-Query Attention - share key/values across heads"""
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        
         self.d_model = d_model
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
         
-        # Token and position embeddings
-        self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)  # padding_idx=0 for pad token
-        self.position_embedding = nn.Embedding(max_seq_len, d_model)
+        self.w_q = nn.Linear(d_model, d_model)  # Separate for each head
+        self.w_k = nn.Linear(d_model, self.d_k)  # Shared across heads
+        self.w_v = nn.Linear(d_model, self.d_k)  # Shared across heads
+        self.w_o = nn.Linear(d_model, d_model)
         
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            batch_first=True,
-            dropout=0.1
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(self.d_k)
         
-        # Output layer with dropout for regularization
-        self.dropout = nn.Dropout(0.1)
-        self.output_layer = nn.Linear(d_model, vocab_size)
+    def forward(self, q, k, v, mask=None):
+        batch_size, seq_len = q.size(0), q.size(1)
         
-        # Initialize weights properly
-        self.apply(self._init_weights)
+        # Linear projections
+        q = self.w_q(q).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(k).unsqueeze(1).expand(batch_size, self.n_heads, seq_len, self.d_k)
+        v = self.w_v(v).unsqueeze(1).expand(batch_size, self.n_heads, seq_len, self.d_k)
         
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
         
-    def forward(self, input_ids, labels=None):
-        batch_size, seq_len = input_ids.shape
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
         
-        # Ensure all token IDs are within valid range
-        input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
         
-        # Create token embeddings
-        token_embeds = self.token_embedding(input_ids)
+        output = torch.matmul(attn_weights, v)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         
-        # Create position embeddings
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
-        position_embeds = self.position_embedding(positions)
-        
-        # Combine embeddings
-        x = token_embeds + position_embeds
-        
-        # Create attention mask (ignore padding tokens)
-        attention_mask = (input_ids != 0).float()
-        
-        # Transformer with attention mask
-        x = self.transformer(x, src_key_padding_mask=attention_mask == 0)
-        
-        # Apply dropout
-        x = self.dropout(x)
-        
-        # Output
-        logits = self.output_layer(x)
-        
-        # Calculate loss if labels provided
-        loss = None
-        if labels is not None:
-            # Ensure labels are within valid range
-            labels = torch.clamp(labels, 0, self.vocab_size - 1)
-            
-            # Create loss mask to ignore padding tokens
-            loss_mask = (labels != 0).float()
-            
-            loss_fn = nn.CrossEntropyLoss(ignore_index=0, reduction='none')  # ignore padding
-            losses = loss_fn(logits.view(-1, self.vocab_size), labels.view(-1))
-            loss = (losses * loss_mask.view(-1)).sum() / loss_mask.sum()
-        
-        return {'logits': logits, 'loss': loss}
+        return self.w_o(output)
 
 # =============================================================================
 # ENHANCED MODEL COMPONENTS
@@ -403,35 +407,162 @@ class FeedForward(nn.Module):
             self.activation = nn.ReLU()
         elif activation == "swish":
             self.activation = nn.SiLU()
+        elif activation == "swiglu":
+            self.activation = SwiGLU(d_model, d_ff)
+            self.linear1 = None  # SwiGLU handles this internally
+            self.linear2 = None
         else:
             self.activation = nn.GELU()
             
     def forward(self, x):
-        return self.linear2(self.dropout(self.activation(self.linear1(x))))
+        if isinstance(self.activation, SwiGLU):
+            return self.activation(x)
+        else:
+            return self.linear2(self.dropout(self.activation(self.linear1(x))))
 
 class TransformerBlock(nn.Module):
     """Enhanced transformer block with residual connections"""
-    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1, activation="gelu"):
+    def __init__(self, d_model, n_heads, d_ff=None, dropout=0.1, activation="gelu", 
+                 use_rmsnorm=False, use_layerscale=False, use_rezero=False):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, dropout)
+        
+        # Attention mechanism selection
+        self.use_multi_query = False
+        if n_heads > 8:  # Use multi-query for larger models
+            self.attention = MultiQueryAttention(d_model, n_heads, dropout)
+            self.use_multi_query = True
+        else:
+            self.attention = MultiHeadAttention(d_model, n_heads, dropout)
+        
+        # Feed forward
         self.feed_forward = FeedForward(d_model, d_ff, dropout, activation)
         
-        self.residual1 = ResidualConnection(d_model, dropout)
-        self.residual2 = ResidualConnection(d_model, dropout)
+        # Normalization selection
+        self.use_rmsnorm = use_rmsnorm
+        self.use_layerscale = use_layerscale
+        self.use_rezero = use_rezero
+        
+        if use_rezero:
+            self.residual1 = ReZero()
+            self.residual2 = ReZero()
+        else:
+            if use_rmsnorm:
+                norm_class = RMSNorm
+            else:
+                norm_class = LayerNormalization
+                
+            self.residual1 = ResidualConnection(d_model, dropout)
+            self.residual2 = ResidualConnection(d_model, dropout)
+            
+            if use_layerscale:
+                self.layerscale1 = LayerScale(d_model)
+                self.layerscale2 = LayerScale(d_model)
         
     def forward(self, x, mask=None):
-        x = self.residual1(x, lambda x: self.attention(x, x, x, mask))
-        x = self.residual2(x, self.feed_forward)
+        if self.use_rezero:
+            x = self.residual1(x, lambda x: self.attention(x, x, x, mask))
+            x = self.residual2(x, self.feed_forward)
+        else:
+            x = self.residual1(x, lambda x: self.attention(x, x, x, mask))
+            x = self.residual2(x, self.feed_forward)
+            
+            if self.use_layerscale:
+                x = self.layerscale1(x)
+                x = self.layerscale2(x)
+        
         return x
 
-class EnhancedGPT(nn.Module):
-    """Enhanced GPT model with multiple improvements"""
-    def __init__(self, vocab_size, d_model=512, n_layers=6, n_heads=8, max_seq_len=512, 
-                 dropout=0.1, activation="gelu", use_enhanced_pe=True, use_layer_norm=True):
+class SimpleGPT(nn.Module):
+    """A simplified GPT-like model for faster training"""
+    def __init__(self, vocab_size, d_model=512, n_layers=6, n_heads=8, max_seq_len=512):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
+        
+        # Token and position embeddings
+        self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)  # padding_idx=0 for pad token
+        self.position_embedding = nn.Embedding(max_seq_len, d_model)
+        
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            batch_first=True,
+            dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # Output layer with dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        self.output_layer = nn.Linear(d_model, vocab_size)
+        
+        # Initialize weights properly
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+    def forward(self, input_ids, labels=None):
+        batch_size, seq_len = input_ids.shape
+        
+        # Ensure all token IDs are within valid range
+        input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
+        
+        # Create token embeddings
+        token_embeds = self.token_embedding(input_ids)
+        
+        # Create position embeddings
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+        position_embeds = self.position_embedding(positions)
+        
+        # Combine embeddings
+        x = token_embeds + position_embeds
+        
+        # Create attention mask (ignore padding tokens)
+        attention_mask = (input_ids != 0).float()
+        
+        # Transformer with attention mask
+        x = self.transformer(x, src_key_padding_mask=attention_mask == 0)
+        
+        # Apply dropout
+        x = self.dropout(x)
+        
+        # Output
+        logits = self.output_layer(x)
+        
+        # Calculate loss if labels provided
+        loss = None
+        if labels is not None:
+            # Ensure labels are within valid range
+            labels = torch.clamp(labels, 0, self.vocab_size - 1)
+            
+            # Create loss mask to ignore padding tokens
+            loss_mask = (labels != 0).float()
+            
+            loss_fn = nn.CrossEntropyLoss(ignore_index=0, reduction='none')  # ignore padding
+            losses = loss_fn(logits.view(-1, self.vocab_size), labels.view(-1))
+            loss = (losses * loss_mask.view(-1)).sum() / loss_mask.sum()
+        
+        return {'logits': logits, 'loss': loss}
+
+class EnhancedGPT(nn.Module):
+    """Enhanced GPT model with multiple improvements"""
+    def __init__(self, vocab_size, d_model=512, n_layers=6, n_heads=8, max_seq_len=512, 
+                 dropout=0.1, activation="gelu", use_enhanced_pe=True, use_layer_norm=True,
+                 use_rmsnorm=False, use_layerscale=False, use_rezero=False, use_swiglu=False,
+                 use_multi_query=False, use_gradient_checkpointing=False):
+        super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Token embedding
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
@@ -443,15 +574,27 @@ class EnhancedGPT(nn.Module):
         else:
             self.pos_embedding = nn.Embedding(max_seq_len, d_model)
         
+        # Activation selection
+        if use_swiglu:
+            activation = "swiglu"
+        
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_model * 4, dropout, activation)
+            TransformerBlock(
+                d_model, n_heads, d_model * 4, dropout, activation,
+                use_rmsnorm=use_rmsnorm,
+                use_layerscale=use_layerscale,
+                use_rezero=use_rezero
+            )
             for _ in range(n_layers)
         ])
         
         # Enhanced layer normalization
         self.use_layer_norm = use_layer_norm
-        if use_layer_norm:
+        self.use_rmsnorm = use_rmsnorm
+        if use_rmsnorm:
+            self.final_norm = RMSNorm(d_model)
+        elif use_layer_norm:
             self.final_norm = LayerNormalization(d_model)
         else:
             self.final_norm = nn.LayerNorm(d_model)
@@ -478,6 +621,10 @@ class EnhancedGPT(nn.Module):
         elif isinstance(module, LayerNormalization):
             torch.nn.init.ones_(module.gamma)
             torch.nn.init.zeros_(module.beta)
+        elif isinstance(module, RMSNorm):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, LayerScale):
+            torch.nn.init.constant_(module.gamma, 1e-2)
         
     def forward(self, input_ids, labels=None, attention_mask=None):
         batch_size, seq_len = input_ids.shape
@@ -508,9 +655,12 @@ class EnhancedGPT(nn.Module):
         else:
             mask = causal_mask
         
-        # Transformer layers
+        # Transformer layers with optional gradient checkpointing
         for layer in self.layers:
-            x = layer(x, mask)
+            if self.use_gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(layer, x, mask)
+            else:
+                x = layer(x, mask)
         
         # Final normalization
         x = self.final_norm(x)
@@ -578,7 +728,357 @@ class EnhancedGPT(nn.Module):
             return input_ids
 
 # =============================================================================
-# MODEL ENHANCEMENTS MANAGER
+# ADVANCED OPTIMIZERS
+# =============================================================================
+
+class SophiaOptimizer(torch.optim.Optimizer):
+    """Sophia: Second-order clipped stochastic optimization"""
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, 
+                 clip_threshold=1.0, update_frequency=10):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                       clip_threshold=clip_threshold, update_frequency=update_frequency)
+        super().__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+            
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                    
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Sophia does not support sparse gradients')
+                
+                state = self.state[p]
+                
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_hessian'] = torch.zeros_like(p.data)
+                
+                exp_avg, exp_hessian = state['exp_avg'], state['exp_hessian']
+                beta1, beta2 = group['betas']
+                
+                state['step'] += 1
+                
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # Update hessian estimate periodically
+                if state['step'] % group['update_frequency'] == 0:
+                    hessian_estimate = grad ** 2
+                    exp_hessian.mul_(beta2).add_(hessian_estimate, alpha=1 - beta2)
+                
+                # Sophia update
+                denom = exp_hessian.sqrt().add_(group['eps'])
+                update = exp_avg / denom
+                
+                # Clip the update
+                update = torch.clamp(update, -group['clip_threshold'], group['clip_threshold'])
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    p.data.add_(p.data, alpha=-group['lr'] * group['weight_decay'])
+                
+                # Apply update
+                p.data.add_(update, alpha=-group['lr'])
+
+class LIONOptimizer(torch.optim.Optimizer):
+    """LION: EvoLved Sign Momentum optimizer"""
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+            
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                    
+                grad = p.grad
+                state = self.state[p]
+                
+                # State initialization
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+                
+                exp_avg = state['exp_avg']
+                beta1, beta2 = group['betas']
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=group['weight_decay'])
+                
+                # Update momentum
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # LION update
+                update = torch.sign(exp_avg * beta2 + grad * (1 - beta2))
+                p.add_(update, alpha=-group['lr'])
+
+# =============================================================================
+# ADVANCED TECHNIQUES MANAGER
+# =============================================================================
+
+class AdvancedTechniquesManager:
+    """Manages all advanced training techniques"""
+    
+    def __init__(self):
+        self.techniques = {
+            # Architecture Enhancements
+            "rms_norm": {
+                "name": "RMSNorm",
+                "description": "Root Mean Square Normalization (LLaMA)",
+                "enabled": False,
+                "category": "architecture",
+                "config": {"eps": 1e-5}
+            },
+            "layer_scale": {
+                "name": "LayerScale",
+                "description": "Learnable scaling for residual connections",
+                "enabled": False,
+                "category": "architecture", 
+                "config": {"init_value": 1e-2}
+            },
+            "re_zero": {
+                "name": "ReZero",
+                "description": "Learnable residual scaling with zero init",
+                "enabled": False,
+                "category": "architecture",
+                "config": {}
+            },
+            "swiglu": {
+                "name": "SwiGLU",
+                "description": "Swish-Gated Linear Unit activation",
+                "enabled": False,
+                "category": "architecture",
+                "config": {}
+            },
+            "multi_query_attention": {
+                "name": "Multi-Query Attention", 
+                "description": "Share key/values across attention heads",
+                "enabled": False,
+                "category": "architecture",
+                "config": {"min_heads": 8}
+            },
+            
+            # Optimization Techniques
+            "sophia_optimizer": {
+                "name": "Sophia Optimizer",
+                "description": "Second-order clipped stochastic optimization",
+                "enabled": False,
+                "category": "optimization",
+                "config": {"lr": 1e-3, "clip_threshold": 1.0}
+            },
+            "lion_optimizer": {
+                "name": "LION Optimizer", 
+                "description": "EvoLved Sign Momentum optimizer",
+                "enabled": False,
+                "category": "optimization",
+                "config": {"lr": 1e-4}
+            },
+            "8bit_optimizer": {
+                "name": "8-bit Optimizers",
+                "description": "Memory-efficient 8-bit Adam/AdamW",
+                "enabled": False,
+                "category": "optimization",
+                "config": {}
+            },
+            
+            # Regularization Techniques
+            "stochastic_depth": {
+                "name": "Stochastic Depth",
+                "description": "Randomly skip layers during training",
+                "enabled": False,
+                "category": "regularization",
+                "config": {"drop_rate": 0.1}
+            },
+            "layer_drop": {
+                "name": "LayerDrop",
+                "description": "Structured layer dropping",
+                "enabled": False,
+                "category": "regularization", 
+                "config": {"drop_rate": 0.1}
+            },
+            "weight_standardization": {
+                "name": "Weight Standardization",
+                "description": "Normalize weights instead of activations",
+                "enabled": False,
+                "category": "regularization",
+                "config": {}
+            },
+            "gradient_centralization": {
+                "name": "Gradient Centralization", 
+                "description": "Zero-mean gradient constraints",
+                "enabled": False,
+                "category": "regularization",
+                "config": {}
+            },
+            
+            # Efficiency Techniques
+            "gradient_checkpointing": {
+                "name": "Gradient Checkpointing",
+                "description": "Trade compute for memory (25% savings)",
+                "enabled": False,
+                "category": "efficiency",
+                "config": {}
+            },
+            "mixed_precision": {
+                "name": "Mixed Precision Training",
+                "description": "FP16/FP32 hybrid training (2x speed)",
+                "enabled": False,
+                "category": "efficiency",
+                "config": {"dtype": "float16"}
+            },
+            "activation_checkpointing": {
+                "name": "Activation Checkpointing",
+                "description": "Selective activation saving",
+                "enabled": False,
+                "category": "efficiency", 
+                "config": {"frequency": 4}
+            },
+            
+            # Training Strategies
+            "curriculum_learning": {
+                "name": "Curriculum Learning",
+                "description": "Easy to hard sample progression",
+                "enabled": False,
+                "category": "strategy",
+                "config": {"warmup_epochs": 2}
+            },
+            "sequence_warmup": {
+                "name": "Sequence Length Warmup",
+                "description": "Start with short sequences, grow longer",
+                "enabled": False,
+                "category": "strategy",
+                "config": {"start_length": 128, "growth_factor": 2}
+            },
+            "dynamic_batching": {
+                "name": "Dynamic Batching",
+                "description": "Optimize batch sizes per sequence length", 
+                "enabled": False,
+                "category": "strategy",
+                "config": {"max_tokens": 4096}
+            },
+            
+            # Advanced Scheduling
+            "warmup_strategies": {
+                "name": "Advanced Warmup",
+                "description": "Linear, exponential, or constant warmup",
+                "enabled": False,
+                "category": "scheduling",
+                "config": {"strategy": "linear", "duration": 0.1}
+            },
+            "cooldown_phase": {
+                "name": "Cooldown Phase",
+                "description": "Final fine-tuning with very low LR",
+                "enabled": False,
+                "category": "scheduling",
+                "config": {"cooldown_epochs": 1, "min_lr": 1e-7}
+            },
+            "cycle_scheduling": {
+                "name": "Cycle Scheduling",
+                "description": "Multiple learning rate restarts",
+                "enabled": False,
+                "category": "scheduling",
+                "config": {"cycle_length": 5, "decay_factor": 0.5}
+            },
+            
+            # Knowledge Distillation
+            "knowledge_distillation": {
+                "name": "Knowledge Distillation",
+                "description": "Teacher-student training paradigm",
+                "enabled": False,
+                "category": "distillation",
+                "config": {"temperature": 2.0, "alpha": 0.7}
+            },
+            "self_distillation": {
+                "name": "Self-Distillation",
+                "description": "Distill knowledge from same model",
+                "enabled": False,
+                "category": "distillation",
+                "config": {"temperature": 1.5}
+            },
+            
+            # Advanced Initialization
+            "advanced_init": {
+                "name": "Advanced Initialization",
+                "description": "Xavier, Kaiming, or Orthogonal init",
+                "enabled": False,
+                "category": "initialization",
+                "config": {"method": "kaiming"}
+            },
+            
+            # Ensemble Methods
+            "model_ema": {
+                "name": "Model EMA",
+                "description": "Exponential Moving Average of weights",
+                "enabled": False,
+                "category": "ensemble",
+                "config": {"decay": 0.995}
+            },
+            "swa": {
+                "name": "Stochastic Weight Averaging",
+                "description": "Average weights from different training stages",
+                "enabled": False,
+                "category": "ensemble",
+                "config": {"start_epoch": 10, "frequency": 1}
+            },
+            
+            # Monitoring & Debugging
+            "gradient_monitoring": {
+                "name": "Gradient Monitoring",
+                "description": "Track gradient norms and distributions",
+                "enabled": False,
+                "category": "monitoring",
+                "config": {"log_frequency": 100}
+            },
+            "activation_monitoring": {
+                "name": "Activation Monitoring",
+                "description": "Track activation statistics and outliers",
+                "enabled": False,
+                "category": "monitoring",
+                "config": {"log_frequency": 100}
+            }
+        }
+    
+    def get_enabled_techniques(self, category=None):
+        """Get enabled techniques, optionally filtered by category"""
+        if category:
+            return {name: config for name, config in self.techniques.items() 
+                   if config["enabled"] and config["category"] == category}
+        return {name: config for name, config in self.techniques.items() if config["enabled"]}
+    
+    def toggle_technique(self, technique_name, enabled=None):
+        """Toggle a technique on/off"""
+        if technique_name in self.techniques:
+            if enabled is None:
+                self.techniques[technique_name]["enabled"] = not self.techniques[technique_name]["enabled"]
+            else:
+                self.techniques[technique_name]["enabled"] = enabled
+            return True
+        return False
+    
+    def update_config(self, technique_name, config_updates):
+        """Update configuration for a technique"""
+        if technique_name in self.techniques:
+            self.techniques[technique_name]["config"].update(config_updates)
+            return True
+        return False
+
+# =============================================================================
+# MODEL ENHANCEMENTS MANAGER (Original)
 # =============================================================================
 
 class ModelEnhancements:
@@ -803,6 +1303,280 @@ class ModelDownloader:
         }, save_path)
         
         return save_path
+
+# =============================================================================
+# TECHNIQUE CONFIG DIALOG (Enhanced)
+# =============================================================================
+
+class TechniqueConfigDialog:
+    """Dialog for configuring individual techniques"""
+    
+    def __init__(self, parent, technique_name, technique_config):
+        self.technique_name = technique_name
+        self.technique_config = technique_config
+        self.config_vars = {}
+        
+        self.top = tk.Toplevel(parent)
+        self.top.title(f"Configure {technique_name.replace('_', ' ').title()}")
+        self.top.geometry("400x300")
+        self.top.grab_set()
+        
+        # Main frame
+        main_frame = ttk.Frame(self.top, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text=f"Configure {technique_name.replace('_', ' ').title()}",
+                               font=('Arial', 12, 'bold'))
+        title_label.pack(pady=10)
+        
+        # Configuration options frame
+        config_frame = ttk.LabelFrame(main_frame, text="Configuration Options", padding="10")
+        config_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        self.create_config_widgets(config_frame)
+        
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(button_frame, text="OK", command=self.apply_config).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self.top.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def create_config_widgets(self, parent):
+        """Create configuration widgets based on the technique's config"""
+        row = 0
+        
+        for config_key, config_value in self.technique_config["config"].items():
+            # Label
+            label_text = config_key.replace('_', ' ').title()
+            ttk.Label(parent, text=label_text + ":").grid(row=row, column=0, sticky=tk.W, pady=5, padx=5)
+            
+            # Input widget based on value type
+            if isinstance(config_value, (int, float)):
+                # For numbers, use scale or entry
+                if isinstance(config_value, int) and config_value > 10:
+                    var = tk.IntVar(value=config_value)
+                    entry = ttk.Entry(parent, textvariable=var, width=10)
+                    entry.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+                else:
+                    var = tk.DoubleVar(value=config_value)
+                    if isinstance(config_value, int):
+                        var = tk.IntVar(value=config_value)
+                    
+                    # Determine range based on config key
+                    if config_key in ['lr', 'min_lr', 'init_value']:
+                        # Learning rate related - small values
+                        scale = ttk.Scale(parent, from_=0.0001, to=0.1, variable=var, orient=tk.HORIZONTAL)
+                    elif config_key in ['drop_rate', 'weight_decay']:
+                        # Rates - 0 to 1
+                        scale = ttk.Scale(parent, from_=0.0, to=1.0, variable=var, orient=tk.HORIZONTAL)
+                    else:
+                        # General numeric values
+                        scale = ttk.Scale(parent, from_=0, to=1000, variable=var, orient=tk.HORIZONTAL)
+                    
+                    scale.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+                    
+                    # Value display
+                    value_label = ttk.Label(parent, textvariable=tk.StringVar(value=str(config_value)))
+                    value_label.grid(row=row, column=2, padx=5)
+                    var.trace('w', lambda *args, v=var, l=value_label: l.config(text=f"{v.get():.4f}"))
+            
+            elif isinstance(config_value, str):
+                # For strings, use combobox for known options or entry
+                var = tk.StringVar(value=config_value)
+                if config_key in ['strategy', 'dtype', 'method']:
+                    # Known categorical values
+                    if config_key == 'strategy':
+                        options = ['linear', 'exponential', 'constant']
+                    elif config_key == 'dtype':
+                        options = ['float16', 'bfloat16', 'float32']
+                    elif config_key == 'method':
+                        options = ['kaiming', 'xavier', 'orthogonal']
+                    else:
+                        options = [config_value]
+                    
+                    combo = ttk.Combobox(parent, textvariable=var, values=options, state="readonly")
+                    combo.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+                else:
+                    entry = ttk.Entry(parent, textvariable=var)
+                    entry.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+            
+            elif isinstance(config_value, bool):
+                # For booleans, use checkbox
+                var = tk.BooleanVar(value=config_value)
+                checkbox = ttk.Checkbutton(parent, variable=var)
+                checkbox.grid(row=row, column=1, sticky=tk.W, pady=5, padx=5)
+            
+            else:
+                # Fallback - display as string
+                var = tk.StringVar(value=str(config_value))
+                entry = ttk.Entry(parent, textvariable=var)
+                entry.grid(row=row, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+            
+            self.config_vars[config_key] = var
+            row += 1
+        
+        parent.columnconfigure(1, weight=1)
+    
+    def apply_config(self):
+        """Apply the configuration changes"""
+        try:
+            for config_key, var in self.config_vars.items():
+                # Convert back to appropriate type
+                current_value = self.technique_config["config"][config_key]
+                new_value = var.get()
+                
+                # Type conversion
+                if isinstance(current_value, int):
+                    new_value = int(float(new_value))
+                elif isinstance(current_value, float):
+                    new_value = float(new_value)
+                elif isinstance(current_value, bool):
+                    new_value = bool(new_value)
+                
+                self.technique_config["config"][config_key] = new_value
+            
+            self.top.destroy()
+            
+        except Exception as e:
+            messagebox.showerror("Configuration Error", f"Failed to apply configuration: {str(e)}")
+
+# =============================================================================
+# ADVANCED TECHNIQUES DIALOG
+# =============================================================================
+
+class AdvancedTechniquesDialog:
+    """Dialog for configuring advanced training techniques"""
+    
+    def __init__(self, parent, techniques_manager):
+        self.techniques = techniques_manager
+        self.top = tk.Toplevel(parent)
+        self.top.title("Advanced Training Techniques")
+        self.top.geometry("900x700")
+        self.top.grab_set()
+        
+        # Main frame
+        main_frame = ttk.Frame(self.top, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Advanced Training Techniques", 
+                               font=('Arial', 14, 'bold'))
+        title_label.pack(pady=10)
+        
+        # Description
+        desc_label = ttk.Label(main_frame, 
+                              text="Enable and configure cutting-edge training techniques. Hover for details.",
+                              font=('Arial', 9), foreground="gray")
+        desc_label.pack(pady=5)
+        
+        # Create scrolling frame
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Technique categories
+        categories = {
+            "architecture": "🧠 Architecture Enhancements",
+            "optimization": "⚡ Optimization Methods", 
+            "regularization": "🛡️ Regularization Techniques",
+            "efficiency": "💾 Efficiency Methods",
+            "strategy": "🎯 Training Strategies",
+            "scheduling": "📈 Advanced Scheduling",
+            "distillation": "🎓 Knowledge Distillation",
+            "initialization": "🔧 Advanced Initialization",
+            "ensemble": "🤝 Ensemble Methods",
+            "monitoring": "📊 Monitoring & Debugging"
+        }
+        
+        self.technique_vars = {}
+        row_idx = 0
+        
+        for category, category_name in categories.items():
+            # Category header
+            cat_frame = ttk.LabelFrame(scrollable_frame, text=category_name, padding="10")
+            cat_frame.grid(row=row_idx, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+            cat_frame.columnconfigure(1, weight=1)
+            row_idx += 1
+            
+            cat_techniques = {name: config for name, config in self.techniques.techniques.items() 
+                             if config["category"] == category}
+            
+            for tech_name, tech_config in cat_techniques.items():
+                var = tk.BooleanVar(value=tech_config["enabled"])
+                self.technique_vars[tech_name] = var
+                
+                # Technique checkbox
+                cb = ttk.Checkbutton(cat_frame, text=tech_config["name"], variable=var,
+                                   command=lambda t=tech_name: self.toggle_technique(t))
+                cb.grid(row=row_idx, column=0, sticky=tk.W, pady=2)
+                
+                # Description
+                desc = ttk.Label(cat_frame, text=tech_config["description"], 
+                               font=('Arial', 8), foreground="gray", wraplength=600)
+                desc.grid(row=row_idx, column=1, sticky=tk.W, pady=2, padx=10)
+                
+                # Configure button for techniques with config
+                if tech_config["config"]:
+                    config_btn = ttk.Button(cat_frame, text="⚙️", width=3,
+                                          command=lambda t=tech_name: self.configure_technique(t))
+                    config_btn.grid(row=row_idx, column=2, padx=5)
+                
+                row_idx += 1
+        
+        # Buttons
+        button_frame = ttk.Frame(scrollable_frame)
+        button_frame.grid(row=row_idx, column=0, pady=20)
+        
+        ttk.Button(button_frame, text="Apply All", command=self.apply_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Reset All", command=self.reset_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", command=self.top.destroy).pack(side=tk.LEFT, padx=5)
+        
+        # Configure weights
+        scrollable_frame.columnconfigure(0, weight=1)
+    
+    def toggle_technique(self, technique_name):
+        """Toggle a technique based on checkbox state"""
+        enabled = self.technique_vars[technique_name].get()
+        self.techniques.toggle_technique(technique_name, enabled)
+    
+    def configure_technique(self, technique_name):
+        """Configure a specific technique"""
+        tech_config = self.techniques.techniques[technique_name]
+        
+        # Create configuration dialog instead of simple messagebox
+        dialog = TechniqueConfigDialog(self.top, technique_name, tech_config)
+        self.top.wait_window(dialog.top)
+    
+    def apply_all(self):
+        """Apply all selected techniques"""
+        for tech_name, var in self.technique_vars.items():
+            self.techniques.toggle_technique(tech_name, var.get())
+        messagebox.showinfo("Success", "All techniques applied successfully!")
+    
+    def reset_all(self):
+        """Reset all techniques to disabled"""
+        for tech_name in self.technique_vars:
+            self.technique_vars[tech_name].set(False)
+            self.techniques.toggle_technique(tech_name, False)
+        messagebox.showinfo("Reset", "All techniques have been disabled.")
+
+# =============================================================================
+# PROJECT SELECTION APP (Updated with Advanced Techniques)
+# =============================================================================
 
 class ProjectSelectionApp:
     def __init__(self, root):
@@ -1057,6 +1831,10 @@ class NewProjectDialog:
         messagebox.showinfo("Success", f"Project '{name}' created successfully")
         self.top.destroy()
 
+# =============================================================================
+# AI TRAINER APP (Updated with Advanced Techniques)
+# =============================================================================
+
 class AITrainerApp:
     def __init__(self, root, project_data):
         self.root = root
@@ -1082,6 +1860,9 @@ class AITrainerApp:
         
         # Model enhancements manager
         self.enhancements = ModelEnhancements()
+        
+        # Advanced techniques manager
+        self.advanced_techniques = AdvancedTechniquesManager()
         
         # If fine-tuning, load the base model configuration
         if project_data["model_type"] == "finetune" and project_data["base_model"]:
@@ -1264,6 +2045,11 @@ class AITrainerApp:
         ttk.Button(enhancements_frame, text="Configure Enhancements", 
                   command=self.configure_enhancements).grid(row=row_idx, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
         
+        # Advanced techniques button
+        ttk.Button(enhancements_frame, text="🧠 More Advanced Techniques...", 
+                  command=self.show_advanced_techniques,
+                  style="Accent.TButton").grid(row=row_idx + 1, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
+        
         # Right panel for status and output
         status_frame = ttk.LabelFrame(main_frame, text="Status & Output", padding="5")
         status_frame.grid(row=1, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
@@ -1300,6 +2086,13 @@ class AITrainerApp:
         """Open enhancement configuration dialog"""
         dialog = EnhancementConfigDialog(self.root, self.enhancements)
         self.root.wait_window(dialog.top)
+    
+    def show_advanced_techniques(self):
+        """Open advanced techniques dialog"""
+        dialog = AdvancedTechniquesDialog(self.root, self.advanced_techniques)
+        self.root.wait_window(dialog.top)
+        enabled_count = len(self.advanced_techniques.get_enabled_techniques())
+        self.log_output(f"Advanced techniques: {enabled_count} enabled")
     
     def back_to_projects(self):
         """Return to project selection screen"""
@@ -1502,6 +2295,11 @@ class AITrainerApp:
             enabled_enhancements = self.enhancements.get_enabled_enhancements()
             self.log_output(f"Enabled enhancements: {list(enabled_enhancements.keys())}")
             
+            # Get enabled advanced techniques
+            enabled_techniques = self.advanced_techniques.get_enabled_techniques()
+            if enabled_techniques:
+                self.log_output(f"Advanced techniques: {list(enabled_techniques.keys())}")
+            
             # Setup enhanced optimizer if scheduling is enabled
             total_steps = len(dataloader) * int(self.epochs_var.get())
             
@@ -1544,6 +2342,12 @@ class AITrainerApp:
                 early_stopping_patience = enabled_enhancements["early_stopping"]["config"].get("patience", 3)
                 self.log_output(f"Early stopping enabled with patience {early_stopping_patience}")
             
+            # Gradient monitoring setup
+            gradient_monitoring_enabled = "gradient_monitoring" in enabled_techniques
+            if gradient_monitoring_enabled:
+                log_frequency = enabled_techniques["gradient_monitoring"]["config"]["log_frequency"]
+                self.log_output(f"Gradient monitoring enabled (log every {log_frequency} steps)")
+            
             for epoch in range(num_epochs):
                 if self.stop_training_flag:
                     break
@@ -1585,6 +2389,16 @@ class AITrainerApp:
                         if "advanced_regularization" in enabled_enhancements:
                             max_norm = enabled_enhancements["advanced_regularization"]["config"].get("gradient_clip", 1.0)
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+                        
+                        # Gradient monitoring
+                        if gradient_monitoring_enabled and batch_idx % log_frequency == 0:
+                            total_norm = 0.0
+                            for p in self.model.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2)
+                                    total_norm += param_norm.item() ** 2
+                            total_norm = total_norm ** 0.5
+                            self.log_output(f"Gradient Norm: {total_norm:.6f}")
                         
                         optimizer.step()
                         optimizer.zero_grad()
@@ -1672,7 +2486,8 @@ class AITrainerApp:
                     },
                     'project_info': self.project_data,
                     'use_enhanced': self.model_config.get("use_enhanced", False),
-                    'enhancements': self.enhancements.get_enabled_enhancements()
+                    'enhancements': self.enhancements.get_enabled_enhancements(),
+                    'advanced_techniques': self.advanced_techniques.get_enabled_techniques()
                 }, file_path)
                 
                 success_msg = f"Model saved to {file_path}"
@@ -1729,6 +2544,12 @@ class AITrainerApp:
                             if enh_name in self.enhancement_vars:
                                 self.enhancement_vars[enh_name].set(enh_config.get('enabled', False))
                 
+                # Load advanced techniques if available
+                if 'advanced_techniques' in checkpoint:
+                    for tech_name, tech_config in checkpoint['advanced_techniques'].items():
+                        if tech_name in self.advanced_techniques.techniques:
+                            self.advanced_techniques.techniques[tech_name].update(tech_config)
+                
                 # Update UI with loaded config
                 self.embd_var.set(str(self.model_config['d_model']))
                 self.n_layer_var.set(str(self.model_config['n_layers']))
@@ -1745,6 +2566,10 @@ class AITrainerApp:
                 self.log_output(error_msg)
                 messagebox.showerror("Load Error", error_msg)
 
+# =============================================================================
+# ENHANCEMENT CONFIG DIALOG (Original)
+# =============================================================================
+
 class EnhancementConfigDialog:
     """Dialog for configuring model enhancements"""
     
@@ -1755,7 +2580,7 @@ class EnhancementConfigDialog:
         self.top.geometry("600x500")
         self.top.grab_set()
         
-        # Initialize config_vars dictionary - FIXED: Add this line
+        # Initialize config_vars dictionary
         self.config_vars = {}
         
         # Main frame
