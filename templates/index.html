@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KlutzGPT</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #1a2a6c, #b21f1f, #fdbb2d);
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            width: 100%;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            flex-grow: 1;
+            gap: 20px;
+        }
+        
+        header {
+            text-align: center;
+            padding: 24px;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 8px;
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        
+        .subtitle {
+            color: #7f8c8d;
+            font-size: 1.2rem;
+        }
+        
+        .main-content {
+            display: flex;
+            gap: 20px;
+            flex-grow: 1;
+        }
+        
+        .sidebar {
+            flex: 0 0 280px;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+        
+        .chat-header {
+            padding: 16px 24px;
+            background: #2c3e50;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #2ecc71;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            max-height: 500px;
+        }
+        
+        .message {
+            max-width: 75%;
+            padding: 16px 20px;
+            border-radius: 18px;
+            line-height: 1.5;
+            position: relative;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        }
+        
+        .user-message {
+            align-self: flex-end;
+            background: #3498db;
+            color: white;
+            border-bottom-right-radius: 6px;
+        }
+        
+        .assistant-message {
+            align-self: flex-start;
+            background: #ecf0f1;
+            color: #2c3e50;
+            border-bottom-left-radius: 6px;
+        }
+        
+        .chat-input {
+            padding: 20px;
+            background: #f5f5f5;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+        
+        .message-input {
+            flex: 1;
+            padding: 14px 18px;
+            border: 1px solid #ddd;
+            border-radius: 24px;
+            font-size: 1rem;
+            outline: none;
+            transition: all 0.3s;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+        }
+        
+        .message-input:focus {
+            border-color: #3498db;
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.2);
+        }
+        
+        .send-button {
+            padding: 14px 26px;
+            background: #2c3e50;
+            color: white;
+            border: none;
+            border-radius: 24px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        
+        .send-button:hover {
+            background: #3498db;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+        }
+        
+        .send-button:active {
+            transform: translateY(0);
+        }
+        
+        .send-button:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .model-info {
+            margin-bottom: 8px;
+        }
+        
+        .info-title {
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #2c3e50;
+            font-size: 1rem;
+        }
+        
+        .info-value {
+            color: #7f8c8d;
+            word-break: break-all;
+            font-size: 0.95rem;
+        }
+        
+        .instructions {
+            margin-top: 8px;
+        }
+        
+        .instructions h3 {
+            margin-bottom: 12px;
+            color: #2c3e50;
+            font-size: 1.1rem;
+        }
+        
+        .instructions ul {
+            padding-left: 20px;
+            color: #7f8c8d;
+        }
+        
+        .instructions li {
+            margin-bottom: 10px;
+            font-size: 0.95rem;
+            line-height: 1.4;
+        }
+        
+        .thinking {
+            opacity: 0.7;
+            font-style: italic;
+        }
+        
+        @media (max-width: 900px) {
+            .main-content {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                flex: 0 0 auto;
+                width: 100%;
+            }
+            
+            .message {
+                max-width: 85%;
+            }
+        }
+        
+        @media (max-width: 600px) {
+            body {
+                padding: 12px;
+            }
+            
+            .container {
+                gap: 16px;
+            }
+            
+            header {
+                padding: 20px;
+            }
+            
+            h1 {
+                font-size: 2rem;
+            }
+            
+            .chat-messages {
+                padding: 16px;
+                gap: 12px;
+            }
+            
+            .message {
+                max-width: 90%;
+                padding: 14px 16px;
+            }
+            
+            .chat-input {
+                padding: 16px;
+                flex-direction: column;
+                gap: 12px;
+            }
+            
+            .message-input {
+                width: 100%;
+            }
+            
+            .send-button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>KlutzGPT</h1>
+ 
+        </header>
+        
+        <div class="main-content">
+
+            
+            <div class="chat-container">
+                <div class="chat-header">
+                    <div>Chat</div>
+                    <div class="status">
+                        <span class="status-indicator"></span>
+                        <span id="connectionStatus">Connected</span>
+                    </div>
+                </div>
+                
+                <div class="chat-messages" id="chatMessages">
+                    <div class="message assistant-message">
+                        Hello! How can I help you today?
+                    </div>
+                </div>
+                
+                <div class="chat-input">
+                    <input type="text" class="message-input" id="messageInput" placeholder="Type your message here..." autocomplete="off">
+                    <button class="send-button" id="sendButton">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatMessages = document.getElementById('chatMessages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const modelStatus = document.getElementById('modelStatus');
+        const statusIndicator = document.querySelector('.status-indicator');
+        
+        let chatHistory = [];
+        let isGenerating = false;
+        
+        // Update status based on connection
+        function updateConnectionStatus(connected) {
+            if (connected) {
+                connectionStatus.textContent = 'Connected';
+                statusIndicator.style.background = '#2ecc71';
+                modelStatus.textContent = 'Model loaded and ready';
+            } else {
+                connectionStatus.textContent = 'Connected';
+                statusIndicator.style.background = '#2ecc71';
+                modelStatus.textContent = 'Model loaded and ready';
+            }
+        }
+        
+        // Add message to chat
+        function addMessage(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}-message`;
+            messageDiv.textContent = content;
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            // Add to history
+            chatHistory.push({ role, content });
+        }
+        
+        // Send message to server
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message || isGenerating) return;
+            
+            // Add user message to chat
+            addMessage('user', message);
+            messageInput.value = '';
+            
+            // Show thinking indicator
+            const thinkingDiv = document.createElement('div');
+            thinkingDiv.className = 'message assistant-message thinking';
+            thinkingDiv.id = 'thinkingIndicator';
+            thinkingDiv.textContent = 'Thinking...';
+            chatMessages.appendChild(thinkingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            isGenerating = true;
+            sendButton.disabled = true;
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        history: chatHistory
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                }
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let assistantResponse = '';
+                
+                // Remove thinking indicator
+                const thinkingIndicator = document.getElementById('thinkingIndicator');
+                if (thinkingIndicator) {
+                    thinkingIndicator.remove();
+                }
+                
+                // Create the actual response div
+                const responseDiv = document.createElement('div');
+                responseDiv.className = 'message assistant-message';
+                chatMessages.appendChild(responseDiv);
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') {
+                                // Add final response to history
+                                chatHistory.push({ role: 'assistant', content: assistantResponse });
+                                isGenerating = false;
+                                sendButton.disabled = false;
+                                updateConnectionStatus(true);
+                                return;
+                            }
+                            
+                            try {
+                                const parsed = JSON.parse(data);
+                                if (parsed.text) {
+                                    assistantResponse += parsed.text;
+                                    responseDiv.textContent = assistantResponse;
+                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                }
+                            } catch (e) {
+                                console.error('Error parsing JSON:', e);
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                
+                // Remove thinking indicator
+                const thinkingIndicator = document.getElementById('thinkingIndicator');
+                if (thinkingIndicator) {
+                    thinkingIndicator.remove();
+                }
+                
+                // Show error message
+                addMessage('assistant', 'Sorry, there was an error processing your request. Try again, and email lazerkato.o@gmail.com if the problem persists.');
+                updateConnectionStatus(false);
+                
+                isGenerating = false;
+                sendButton.disabled = false;
+            }
+        }
+        
+        // Event listeners
+        sendButton.addEventListener('click', sendMessage);
+        
+        messageInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        });
+        
+        // Initial connection check
+        fetch('/')
+            .then(response => {
+                if (response.ok) {
+                    updateConnectionStatus(true);
+                } else {
+                    updateConnectionStatus(false);
+                }
+            })
+            .catch(() => {
+                updateConnectionStatus(false);
+            });
+    </script>
+</body>
+</html>
